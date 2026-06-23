@@ -1,30 +1,36 @@
-# aaPanel WebSocket Auth Bypass → Potential RCE
+# aaPanel: Vendors Don't Always Fix Things Properly
 
-## Incomplete fix for CVE-2021-37840
+## An incomplete fix for CVE-2021-37840 still exposes 3.6M servers to root RCE, 5 years later
 
 **Discovered by:** EON Security  
 **CVE:** Pending assignment  
 **CVSS:** 8.8 (High) — AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H  
-**Affected:** aaPanel all versions since 6.8.12 through latest 7.65.0  
+**Affected:** aaPanel versions 6.8.12 through 7.65.0 (every version since the 2021 fix)  
 **Installed base:** 3.6M+ servers  
 
 ---
 
-## TL;DR
+## The Short Version
 
-aaPanel's fix for CVE-2021-37840 (Cross-Site WebSocket Hijacking) was **incomplete**. The fix added an application-layer auth check after the WebSocket connection is established, rather than rejecting unauthenticated connections at the HTTP handshake level. This means:
+In 2021, a Cross-Site WebSocket Hijacking vulnerability (CVE-2021-37840) was disclosed in aaPanel, a free hosting control panel running on 3.6M+ servers. The vendor added a CSRF token check to "fix" it.
 
-1. **All 10 WebSocket endpoints accept connections before verifying authentication** (returns HTTP 101 before checking who you are)
-2. The `check_csrf_websocket()` function has multiple bypass paths:
-   - `g.api_request = True` (API-authenticated requests skip CSRF check entirely)
-   - `g.is_aes = True` (AES-encrypted requests skip CSRF check entirely)
-   - Empty token bypass in sessions where `request_token_head` is not initialized
-3. The `/sock_shell` endpoint executes arbitrary shell commands via `subprocess.Popen(shell=True)`
-4. The `/webssh` endpoint accepts attacker-supplied SSH credentials
+**The fix was architecturally wrong.**
 
-An attacker who tricks a logged-in admin into visiting a malicious page achieves **remote code execution as root**.
+Instead of rejecting unauthenticated WebSocket connections at the HTTP level (returning 401), the fix allows every connection through (returns 101 Switching Protocols) and only checks authentication inside the handler — after the WebSocket is already established. The CSRF check they added can be bypassed in multiple ways.
 
-This is the **10th CVE ever** assigned to aaPanel in its 6+ year history, for a platform with 3.6M+ servers.
+EON Security found that 5 years later, every aaPanel version is still vulnerable to the same attack class.
+
+This is only the **10th CVE ever** assigned to aaPanel in its 6+ year history.
+
+---
+
+## What We Found
+
+1. **All 10 WebSocket endpoints accept connections before verifying who you are** — returns HTTP 101 Switching Protocols before checking authentication
+2. **The CSRF check has hard bypass conditions** — `g.api_request=True` (API-authenticated requests) and `g.is_aes=True` (AES-encrypted requests) skip the check entirely
+3. **The `/sock_shell` endpoint executes arbitrary commands** — `subprocess.Popen(cmd + " 2>&1", shell=True)`
+4. **The `/webssh` endpoint accepts attacker-supplied SSH credentials** — connect to any SSH host
+5. **Runs as root** — full server compromise
 
 ---
 
