@@ -1,6 +1,6 @@
 # aaPanel: Vendors Don't Always Fix Things Properly
 
-## An incomplete fix for CVE-2021-37840 still exposes 3.6M servers to root RCE, 5 years later
+An incomplete fix for CVE-2021-37840 still exposes 3.6M servers to root RCE, 5 years later
 
 **Discovered by:** EON Security  
 **CVE:** Pending assignment  
